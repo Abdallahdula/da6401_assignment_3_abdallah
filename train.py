@@ -1,7 +1,9 @@
 import argparse
 import os
+import random
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -11,6 +13,14 @@ import wandb
 from model import Transformer, make_src_mask, make_tgt_mask
 from lr_scheduler import NoamScheduler
 from dataset import build_dataloaders, PAD_IDX
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 class LabelSmoothingLoss(nn.Module):
@@ -46,7 +56,45 @@ def _step_batch(model, src, tgt, loss_fn, device):
     return loss, correct, total
 
 
-def run_epoch(data_iter, model: Transformer, loss_fn: nn.Module, optimizer: Optional[torch.optim.Optimizer], scheduler=None, is_train: bool = True, device: str = 'cpu'):
+def _l2_norm_from_grad_tensors(grads):
+    total = 0.0
+    for grad in grads:
+        if grad is not None:
+            total += grad.detach().pow(2).sum().item()
+    return total ** 0.5
+
+
+def get_attention_projection_grad_norms(model: Transformer):
+    query_grads = []
+    key_grads = []
+    metrics = {}
+
+    for name, module in model.named_modules():
+        if hasattr(module, 'w_q') and hasattr(module, 'w_k'):
+            q_grad = module.w_q.weight.grad
+            k_grad = module.w_k.weight.grad
+            query_grads.append(q_grad)
+            key_grads.append(k_grad)
+            safe_name = name.replace('.', '/')
+            metrics[f'grad_norm/query/{safe_name}'] = _l2_norm_from_grad_tensors([q_grad])
+            metrics[f'grad_norm/key/{safe_name}'] = _l2_norm_from_grad_tensors([k_grad])
+
+    metrics['grad_norm/query/all_attention'] = _l2_norm_from_grad_tensors(query_grads)
+    metrics['grad_norm/key/all_attention'] = _l2_norm_from_grad_tensors(key_grads)
+    return metrics
+
+
+def run_epoch(
+    data_iter,
+    model: Transformer,
+    loss_fn: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler=None,
+    is_train: bool = True,
+    device: str = 'cpu',
+    global_step: int = 0,
+    grad_log_steps: int = 0,
+):
     model.train(is_train)
     total_loss, total_correct, total_tokens, steps = 0.0, 0, 0, 0
 
@@ -55,6 +103,13 @@ def run_epoch(data_iter, model: Transformer, loss_fn: nn.Module, optimizer: Opti
         if is_train:
             optimizer.zero_grad()
             loss.backward()
+            global_step += 1
+            if grad_log_steps > 0 and global_step <= grad_log_steps:
+                wandb.log({
+                    'train/global_step': global_step,
+                    'train/batch_loss': loss.item(),
+                    **get_attention_projection_grad_norms(model),
+                }, step=global_step)
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
@@ -66,7 +121,7 @@ def run_epoch(data_iter, model: Transformer, loss_fn: nn.Module, optimizer: Opti
 
     avg_loss = total_loss / max(steps, 1)
     token_acc = total_correct / max(total_tokens, 1)
-    return avg_loss, token_acc
+    return avg_loss, token_acc, global_step
 
 
 def greedy_decode(model: Transformer, src: torch.Tensor, src_mask: torch.Tensor, max_len: int, start_symbol: int, end_symbol: int, device: str = 'cpu') -> torch.Tensor:
@@ -83,6 +138,7 @@ def greedy_decode(model: Transformer, src: torch.Tensor, src_mask: torch.Tensor,
 
 
 def run_task_2_1(args):
+    set_seed(args.seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     train_loader, val_loader, _, src_vocab, tgt_vocab = build_dataloaders(
         batch_size=args.batch_size,
@@ -99,6 +155,7 @@ def run_task_2_1(args):
         num_heads=args.heads,
         d_ff=args.d_ff,
         dropout=args.dropout,
+        scale_attention=args.attention_scaling == 'scaled',
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
@@ -109,24 +166,36 @@ def run_task_2_1(args):
         project=args.project,
         entity=args.entity if args.entity else None,
         name=args.run_name,
-        tags=["assignment3", "task2.1", f"scheduler:{args.scheduler}"],
+        tags=["assignment3", args.task, f"scheduler:{args.scheduler}", f"attention_scaling:{args.attention_scaling}"],
         config=vars(args),
     )
 
     best_val_loss = float('inf')
+    global_step = 0
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = run_epoch(train_loader, model, loss_fn, optimizer, scheduler, is_train=True, device=device)
-        val_loss, val_acc = run_epoch(val_loader, model, loss_fn, None, None, is_train=False, device=device)
+        train_loss, train_acc, global_step = run_epoch(
+            train_loader,
+            model,
+            loss_fn,
+            optimizer,
+            scheduler,
+            is_train=True,
+            device=device,
+            global_step=global_step,
+            grad_log_steps=args.grad_log_steps,
+        )
+        val_loss, val_acc, _ = run_epoch(val_loader, model, loss_fn, None, None, is_train=False, device=device, global_step=global_step)
 
         current_lr = optimizer.param_groups[0]['lr']
         wandb.log({
             'epoch': epoch,
+            'train/global_step': global_step,
             'train/loss': train_loss,
             'train/token_accuracy': train_acc,
             'val/loss': val_loss,
             'val/token_accuracy': val_acc,
             'optim/lr': current_lr,
-        })
+        }, step=global_step)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -140,8 +209,12 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--project', type=str, default='da6401-a3')
     p.add_argument('--entity', type=str, default='')
+    p.add_argument('--task', type=str, default='task2.1')
     p.add_argument('--run_name', type=str, required=True)
     p.add_argument('--scheduler', choices=['noam', 'fixed'], required=True)
+    p.add_argument('--attention_scaling', choices=['scaled', 'unscaled'], default='scaled')
+    p.add_argument('--grad_log_steps', type=int, default=0)
+    p.add_argument('--seed', type=int, default=42)
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--batch_size', type=int, default=64)
     p.add_argument('--max_len', type=int, default=128)
