@@ -65,7 +65,7 @@ class MultiHeadAttention(nn.Module):
         return out
 
 
-class PositionalEncoding(nn.Module):
+class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000) -> None:
         super().__init__()
         self.dropout = nn.Dropout(dropout)
@@ -78,6 +78,19 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x):
         x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
+class LearnedPositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.pos_embed = nn.Embedding(max_len, d_model)
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        positions = torch.arange(seq_len, device=x.device).unsqueeze(0)
+        x = x + self.pos_embed(positions)
         return self.dropout(x)
 
 
@@ -150,7 +163,7 @@ class Decoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, src_vocab_size: int = 10000, tgt_vocab_size: int = 10000, d_model=512, N=6, num_heads=8, d_ff=2048, dropout=0.1, checkpoint_path: str = None, scale_attention: bool = True):
+    def __init__(self, src_vocab_size: int = 10000, tgt_vocab_size: int = 10000, d_model=512, N=6, num_heads=8, d_ff=2048, dropout=0.1, checkpoint_path: str = None, scale_attention: bool = True, positional_encoding_type: str = 'sinusoidal', max_len: int = 5000):
         super().__init__()
         self.src_vocab_size = src_vocab_size
         self.tgt_vocab_size = tgt_vocab_size
@@ -160,9 +173,15 @@ class Transformer(nn.Module):
         self.d_ff = d_ff
         self.dropout = dropout
         self.scale_attention = scale_attention
+        self.positional_encoding_type = positional_encoding_type
         self.src_embed = nn.Embedding(src_vocab_size, d_model)
         self.tgt_embed = nn.Embedding(tgt_vocab_size, d_model)
-        self.pos = PositionalEncoding(d_model, dropout)
+        if positional_encoding_type == 'sinusoidal':
+            self.pos = SinusoidalPositionalEncoding(d_model, dropout, max_len=max_len)
+        elif positional_encoding_type == 'learned':
+            self.pos = LearnedPositionalEncoding(d_model, dropout, max_len=max_len)
+        else:
+            raise ValueError(f'Unsupported positional_encoding_type: {positional_encoding_type}')
         self.encoder = Encoder(EncoderLayer(d_model, num_heads, d_ff, dropout, scale_attention=scale_attention), N)
         self.decoder = Decoder(DecoderLayer(d_model, num_heads, d_ff, dropout, scale_attention=scale_attention), N)
         self.generator = nn.Linear(d_model, tgt_vocab_size)
