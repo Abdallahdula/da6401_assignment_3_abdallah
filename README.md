@@ -18,5 +18,6 @@ assignment3/
 
 ## Links
 
-- **GitHub Repository:** https://github.com/Abdallahdula/da6401_assignment_3_abdallah/tree/main
+- **GitHub Repository:** https://github.com/Abdallahdula/da6401_assignment_3_abdallah
+- 
 - **W&B Report:** https://api.wandb.ai/links/zda23m016-iit-madras-zanzibar/x02ekt0k
