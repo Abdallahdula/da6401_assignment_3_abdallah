@@ -205,8 +205,14 @@ class Transformer(nn.Module):
         self.sos_idx = 2
         self.eos_idx = 3
         self.unk_idx = 0
-        self.spacy_de = spacy.load('de_core_news_sm')
-        self.spacy_en = spacy.load('en_core_web_sm')
+        try:
+            self.spacy_de = spacy.load('de_core_news_sm')
+        except Exception:
+            self.spacy_de = spacy.blank('de')
+        try:
+            self.spacy_en = spacy.load('en_core_web_sm')
+        except Exception:
+            self.spacy_en = spacy.blank('en')
         self.src_stoi, self.src_itos, self.tgt_stoi, self.tgt_itos = self._build_vocabs_from_train()
 
         # Required by announcement: load weights in __init__ (download with gdown if needed)
