@@ -1,6 +1,8 @@
 import argparse
+import math
 import os
 import random
+from collections import Counter
 from typing import Optional
 
 import numpy as np
@@ -12,7 +14,7 @@ import wandb
 
 from model import Transformer, make_src_mask, make_tgt_mask
 from lr_scheduler import NoamScheduler
-from dataset import build_dataloaders, PAD_IDX
+from dataset import build_dataloaders, PAD_IDX, SOS_IDX, EOS_IDX
 
 
 def set_seed(seed: int) -> None:
@@ -53,7 +55,11 @@ def _step_batch(model, src, tgt, loss_fn, device):
     non_pad = tgt_out.ne(PAD_IDX)
     correct = (pred.eq(tgt_out) & non_pad).sum().item()
     total = non_pad.sum().item()
-    return loss, correct, total
+
+    probs = torch.softmax(logits, dim=-1)
+    correct_token_probs = probs.gather(-1, tgt_out.unsqueeze(-1)).squeeze(-1)
+    confidence_sum = (correct_token_probs * non_pad).sum().item()
+    return loss, correct, total, confidence_sum
 
 
 def _l2_norm_from_grad_tensors(grads):
@@ -209,10 +215,10 @@ def run_epoch(
     grad_log_steps: int = 0,
 ):
     model.train(is_train)
-    total_loss, total_correct, total_tokens, steps = 0.0, 0, 0, 0
+    total_loss, total_correct, total_tokens, total_confidence, steps = 0.0, 0, 0, 0.0, 0
 
     for src, tgt in data_iter:
-        loss, correct, total = _step_batch(model, src, tgt, loss_fn, device)
+        loss, correct, total, confidence_sum = _step_batch(model, src, tgt, loss_fn, device)
         if is_train:
             optimizer.zero_grad()
             loss.backward()
@@ -230,11 +236,13 @@ def run_epoch(
         total_loss += loss.item()
         total_correct += correct
         total_tokens += total
+        total_confidence += confidence_sum
         steps += 1
 
     avg_loss = total_loss / max(steps, 1)
     token_acc = total_correct / max(total_tokens, 1)
-    return avg_loss, token_acc, global_step
+    prediction_confidence = total_confidence / max(total_tokens, 1)
+    return avg_loss, token_acc, prediction_confidence, global_step
 
 
 def greedy_decode(model: Transformer, src: torch.Tensor, src_mask: torch.Tensor, max_len: int, start_symbol: int, end_symbol: int, device: str = 'cpu') -> torch.Tensor:
@@ -248,6 +256,55 @@ def greedy_decode(model: Transformer, src: torch.Tensor, src_mask: torch.Tensor,
         if next_word == end_symbol:
             break
     return ys
+
+
+
+
+def _extract_tokens(token_ids: torch.Tensor, vocab):
+    tokens = []
+    for idx in token_ids.detach().cpu().tolist():
+        tok = vocab.lookup_token(idx)
+        if tok in {"<sos>", "<eos>", "<pad>"}:
+            continue
+        tokens.append(tok)
+    return tokens
+
+
+def _count_ngrams(tokens, n):
+    return Counter(tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1))
+
+
+def compute_validation_bleu(model: Transformer, val_loader: DataLoader, tgt_vocab, device: str = 'cpu', max_decode_len: int = 128) -> float:
+    model.eval()
+    clipped = [0, 0, 0, 0]
+    total = [0, 0, 0, 0]
+    cand_len = 0
+    ref_len = 0
+
+    with torch.no_grad():
+        for src_batch, tgt_batch in val_loader:
+            src_batch = src_batch.to(device)
+            for i in range(src_batch.size(0)):
+                src = src_batch[i:i+1]
+                ref_tokens = _extract_tokens(tgt_batch[i], tgt_vocab)
+                pred_ids = greedy_decode(model, src, make_src_mask(src, PAD_IDX), max_len=max_decode_len, start_symbol=SOS_IDX, end_symbol=EOS_IDX, device=device).squeeze(0)
+                pred_tokens = _extract_tokens(pred_ids, tgt_vocab)
+
+                cand_len += len(pred_tokens)
+                ref_len += len(ref_tokens)
+
+                for n in range(1, 5):
+                    pred_counts = _count_ngrams(pred_tokens, n)
+                    ref_counts = _count_ngrams(ref_tokens, n)
+                    total[n-1] += sum(pred_counts.values())
+                    clipped[n-1] += sum(min(c, ref_counts.get(g, 0)) for g, c in pred_counts.items())
+
+    precisions = [(clipped[i] / total[i]) if total[i] > 0 else 0.0 for i in range(4)]
+    if min(precisions) == 0:
+        return 0.0
+    bp = 1.0 if cand_len > ref_len else math.exp(1 - (ref_len / max(cand_len, 1)))
+    bleu = bp * math.exp(sum(math.log(p) for p in precisions) / 4.0)
+    return 100.0 * bleu
 
 
 def run_task_2_1(args):
@@ -269,24 +326,26 @@ def run_task_2_1(args):
         d_ff=args.d_ff,
         dropout=args.dropout,
         scale_attention=args.attention_scaling == 'scaled',
+        positional_encoding_type=args.positional_encoding,
+        max_len=args.max_len,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
     scheduler = NoamScheduler(optimizer, d_model=args.d_model, warmup_steps=args.warmup_steps) if args.scheduler == 'noam' else None
-    loss_fn = LabelSmoothingLoss(vocab_size=len(tgt_vocab), pad_idx=PAD_IDX, smoothing=0.1)
+    loss_fn = LabelSmoothingLoss(vocab_size=len(tgt_vocab), pad_idx=PAD_IDX, smoothing=args.label_smoothing)
 
     run = wandb.init(
         project=args.project,
         entity=args.entity if args.entity else None,
         name=args.run_name,
-        tags=["assignment3", args.task, f"scheduler:{args.scheduler}", f"attention_scaling:{args.attention_scaling}"],
+        tags=["assignment3", args.task, f"scheduler:{args.scheduler}", f"attention_scaling:{args.attention_scaling}", f"positional_encoding:{args.positional_encoding}", f"label_smoothing:{args.label_smoothing}"],
         config=vars(args),
     )
 
     best_val_loss = float('inf')
     global_step = 0
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc, global_step = run_epoch(
+        train_loss, train_acc, train_conf, global_step = run_epoch(
             train_loader,
             model,
             loss_fn,
@@ -297,7 +356,8 @@ def run_task_2_1(args):
             global_step=global_step,
             grad_log_steps=args.grad_log_steps,
         )
-        val_loss, val_acc, _ = run_epoch(val_loader, model, loss_fn, None, None, is_train=False, device=device, global_step=global_step)
+        val_loss, val_acc, val_conf, _ = run_epoch(val_loader, model, loss_fn, None, None, is_train=False, device=device, global_step=global_step)
+        val_bleu = compute_validation_bleu(model, val_loader, tgt_vocab, device=device, max_decode_len=args.max_len)
 
         current_lr = optimizer.param_groups[0]['lr']
         wandb.log({
@@ -305,8 +365,11 @@ def run_task_2_1(args):
             'train/global_step': global_step,
             'train/loss': train_loss,
             'train/token_accuracy': train_acc,
+            'train/prediction_confidence': train_conf,
             'val/loss': val_loss,
             'val/token_accuracy': val_acc,
+            'val/prediction_confidence': val_conf,
+            'val/bleu': val_bleu,
             'optim/lr': current_lr,
         }, step=global_step)
 
@@ -329,6 +392,8 @@ def parse_args():
     p.add_argument('--run_name', type=str, required=True)
     p.add_argument('--scheduler', choices=['noam', 'fixed'], required=True)
     p.add_argument('--attention_scaling', choices=['scaled', 'unscaled'], default='scaled')
+    p.add_argument('--positional_encoding', choices=['sinusoidal', 'learned'], default='sinusoidal')
+    p.add_argument('--label_smoothing', type=float, default=0.1)
     p.add_argument('--grad_log_steps', type=int, default=0)
     p.add_argument('--log_attention_maps', action='store_true')
     p.add_argument('--attention_sample_index', type=int, default=0)
