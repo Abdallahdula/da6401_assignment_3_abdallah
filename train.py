@@ -84,6 +84,119 @@ def get_attention_projection_grad_norms(model: Transformer):
     return metrics
 
 
+def _tokens_from_tensor(token_ids: torch.Tensor, vocab):
+    tokens = []
+    for idx in token_ids.detach().cpu().tolist():
+        if idx == PAD_IDX:
+            continue
+        tokens.append(vocab.lookup_token(idx))
+    return tokens
+
+
+def _attention_head_statistics(attn: torch.Tensor, tokens):
+    seq_len = attn.size(-1)
+    positions = torch.arange(seq_len, dtype=torch.float32)
+    distances = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()
+    stats = []
+    eos_positions = [i for i, tok in enumerate(tokens) if tok == '<eos>']
+    eos_idx = eos_positions[0] if eos_positions else seq_len - 1
+
+    for head_idx, head_attn in enumerate(attn):
+        diag_mean = head_attn.diagonal().mean().item()
+        next_token_mean = head_attn.diagonal(offset=1).mean().item() if seq_len > 1 else 0.0
+        previous_token_mean = head_attn.diagonal(offset=-1).mean().item() if seq_len > 1 else 0.0
+        eos_mean = head_attn[:, eos_idx].mean().item()
+        avg_distance = (head_attn * distances).sum(dim=-1).mean().item()
+        entropy = (-(head_attn.clamp_min(1e-12) * head_attn.clamp_min(1e-12).log()).sum(dim=-1)).mean().item()
+        stats.append({
+            'head': head_idx,
+            'diagonal_mean': diag_mean,
+            'next_token_mean': next_token_mean,
+            'previous_token_mean': previous_token_mean,
+            'eos_mean': eos_mean,
+            'avg_attention_distance': avg_distance,
+            'entropy': entropy,
+        })
+    return stats
+
+
+def _attention_heatmap_image(head_attn: torch.Tensor, tokens, head_idx: int):
+    import matplotlib.pyplot as plt
+
+    fig_size = max(6, min(14, 0.55 * len(tokens)))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    im = ax.imshow(head_attn.numpy(), cmap='viridis', vmin=0.0, vmax=1.0)
+    ax.set_title(f'Last encoder self-attention head {head_idx}')
+    ax.set_xlabel('Key token attended to')
+    ax.set_ylabel('Query token')
+    ax.set_xticks(range(len(tokens)))
+    ax.set_yticks(range(len(tokens)))
+    ax.set_xticklabels(tokens, rotation=90)
+    ax.set_yticklabels(tokens)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    image = wandb.Image(fig)
+    plt.close(fig)
+    return image
+
+
+def log_last_encoder_attention_maps(model: Transformer, val_loader: DataLoader, src_vocab, args, device: str) -> None:
+    dataset = val_loader.dataset
+    sample_idx = min(max(args.attention_sample_index, 0), len(dataset) - 1)
+    src_tensor, tgt_tensor = dataset[sample_idx]
+    src = src_tensor.unsqueeze(0).to(device)
+    src_mask = make_src_mask(src, PAD_IDX)
+
+    model.eval()
+    with torch.no_grad():
+        model.encode(src, src_mask)
+
+    last_attn = model.encoder.layers[-1].self_attn.last_attn
+    if last_attn is None:
+        raise RuntimeError('No encoder attention weights were captured. Run model.encode before logging attention maps.')
+
+    last_attn = last_attn[0].detach().cpu()
+    tokens = _tokens_from_tensor(src_tensor, src_vocab)
+    if len(tokens) != last_attn.size(-1):
+        tokens = tokens[:last_attn.size(-1)]
+
+    prefix = 'attention/last_encoder'
+    wandb.log({
+        f'{prefix}/sample_index': sample_idx,
+        f'{prefix}/source_tokens': ' '.join(tokens),
+        f'{prefix}/num_heads': last_attn.size(0),
+    })
+
+    for head_idx, head_attn in enumerate(last_attn):
+        pair_table = wandb.Table(columns=['query_position', 'query_token', 'key_position', 'key_token', 'attention_weight'])
+        for query_pos, query_token in enumerate(tokens):
+            for key_pos, key_token in enumerate(tokens):
+                pair_table.add_data(query_pos, query_token, key_pos, key_token, float(head_attn[query_pos, key_pos].item()))
+        wandb.log({
+            f'{prefix}/head_{head_idx}_heatmap': _attention_heatmap_image(head_attn, tokens, head_idx),
+            f'{prefix}/head_{head_idx}_weights': pair_table,
+        })
+
+    stats_table = wandb.Table(columns=['head', 'diagonal_mean', 'next_token_mean', 'previous_token_mean', 'eos_mean', 'avg_attention_distance', 'entropy'])
+    stats_log = {}
+    for row in _attention_head_statistics(last_attn, tokens):
+        stats_table.add_data(
+            row['head'],
+            row['diagonal_mean'],
+            row['next_token_mean'],
+            row['previous_token_mean'],
+            row['eos_mean'],
+            row['avg_attention_distance'],
+            row['entropy'],
+        )
+        stats_log[f'{prefix}/head_{row["head"]}_diagonal_mean'] = row['diagonal_mean']
+        stats_log[f'{prefix}/head_{row["head"]}_next_token_mean'] = row['next_token_mean']
+        stats_log[f'{prefix}/head_{row["head"]}_avg_attention_distance'] = row['avg_attention_distance']
+        stats_log[f'{prefix}/head_{row["head"]}_entropy'] = row['entropy']
+
+    wandb.log({f'{prefix}/head_statistics': stats_table, **stats_log})
+
+
 def run_epoch(
     data_iter,
     model: Transformer,
@@ -202,6 +315,9 @@ def run_task_2_1(args):
             os.makedirs(args.ckpt_dir, exist_ok=True)
             torch.save({'model_state_dict': model.state_dict()}, os.path.join(args.ckpt_dir, f'best_{args.scheduler}.pt'))
 
+    if args.log_attention_maps:
+        log_last_encoder_attention_maps(model, val_loader, src_vocab, args, device)
+
     run.finish()
 
 
@@ -214,6 +330,8 @@ def parse_args():
     p.add_argument('--scheduler', choices=['noam', 'fixed'], required=True)
     p.add_argument('--attention_scaling', choices=['scaled', 'unscaled'], default='scaled')
     p.add_argument('--grad_log_steps', type=int, default=0)
+    p.add_argument('--log_attention_maps', action='store_true')
+    p.add_argument('--attention_sample_index', type=int, default=0)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--batch_size', type=int, default=64)

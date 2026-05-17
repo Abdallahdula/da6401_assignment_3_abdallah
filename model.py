@@ -44,6 +44,7 @@ class MultiHeadAttention(nn.Module):
         self.w_v = nn.Linear(d_model, d_model)
         self.w_o = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
+        self.last_attn = None
 
     def _split(self, x):
         b, s, _ = x.shape
@@ -58,6 +59,7 @@ class MultiHeadAttention(nn.Module):
         k = self._split(self.w_k(key))
         v = self._split(self.w_v(value))
         out, attn = scaled_dot_product_attention(q, k, v, mask, scale=self.scale_attention)
+        self.last_attn = attn.detach()
         out = self._combine(out)
         out = self.w_o(out)
         return out
