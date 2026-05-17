@@ -1,9 +1,16 @@
+import argparse
+import os
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Optional
+
+import wandb
 
 from model import Transformer, make_src_mask, make_tgt_mask
+from lr_scheduler import NoamScheduler
+from dataset import build_dataloaders, PAD_IDX
 
 
 class LabelSmoothingLoss(nn.Module):
@@ -19,38 +26,54 @@ class LabelSmoothingLoss(nn.Module):
             true_dist = torch.full_like(log_probs, self.smoothing / (self.vocab_size - 1))
             true_dist.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
             true_dist[:, self.pad_idx] = 0
-            pad_mask = target.eq(self.pad_idx)
-            true_dist[pad_mask] = 0
+            true_dist[target.eq(self.pad_idx)] = 0
         loss = -(true_dist * log_probs).sum(dim=1)
-        non_pad = ~target.eq(self.pad_idx)
-        return loss[non_pad].mean()
+        return loss[~target.eq(self.pad_idx)].mean()
 
 
-def run_epoch(data_iter, model: Transformer, loss_fn: nn.Module, optimizer: Optional[torch.optim.Optimizer], scheduler=None, epoch_num: int = 0, is_train: bool = True, device: str = 'cpu') -> float:
+def _step_batch(model, src, tgt, loss_fn, device):
+    src, tgt = src.to(device), tgt.to(device)
+    tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
+    src_mask = make_src_mask(src, PAD_IDX)
+    tgt_mask = make_tgt_mask(tgt_in, PAD_IDX)
+    logits = model(src, tgt_in, src_mask, tgt_mask)
+    loss = loss_fn(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+
+    pred = logits.argmax(dim=-1)
+    non_pad = tgt_out.ne(PAD_IDX)
+    correct = (pred.eq(tgt_out) & non_pad).sum().item()
+    total = non_pad.sum().item()
+    return loss, correct, total
+
+
+def run_epoch(data_iter, model: Transformer, loss_fn: nn.Module, optimizer: Optional[torch.optim.Optimizer], scheduler=None, is_train: bool = True, device: str = 'cpu'):
     model.train(is_train)
-    total = 0.0
-    steps = 0
+    total_loss, total_correct, total_tokens, steps = 0.0, 0, 0, 0
+
     for src, tgt in data_iter:
-        src, tgt = src.to(device), tgt.to(device)
-        tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
-        src_mask, tgt_mask = make_src_mask(src), make_tgt_mask(tgt_in)
-        logits = model(src, tgt_in, src_mask, tgt_mask)
-        loss = loss_fn(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+        loss, correct, total = _step_batch(model, src, tgt, loss_fn, device)
         if is_train:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
-        total += loss.item(); steps += 1
-    return total / max(steps, 1)
+
+        total_loss += loss.item()
+        total_correct += correct
+        total_tokens += total
+        steps += 1
+
+    avg_loss = total_loss / max(steps, 1)
+    token_acc = total_correct / max(total_tokens, 1)
+    return avg_loss, token_acc
 
 
 def greedy_decode(model: Transformer, src: torch.Tensor, src_mask: torch.Tensor, max_len: int, start_symbol: int, end_symbol: int, device: str = 'cpu') -> torch.Tensor:
     memory = model.encode(src.to(device), src_mask.to(device))
     ys = torch.ones(1, 1, dtype=torch.long, device=device) * start_symbol
     for _ in range(max_len - 1):
-        tgt_mask = make_tgt_mask(ys)
+        tgt_mask = make_tgt_mask(ys, PAD_IDX)
         out = model.decode(memory, src_mask.to(device), ys, tgt_mask)
         next_word = torch.argmax(out[:, -1, :], dim=-1).item()
         ys = torch.cat([ys, torch.tensor([[next_word]], device=device)], dim=1)
@@ -59,66 +82,82 @@ def greedy_decode(model: Transformer, src: torch.Tensor, src_mask: torch.Tensor,
     return ys
 
 
-def evaluate_bleu(model: Transformer, test_dataloader: DataLoader, tgt_vocab, device: str = 'cpu', max_len: int = 100) -> float:
-    try:
-        from nltk.translate.bleu_score import corpus_bleu
-    except Exception:
-        return 0.0
-    model.eval()
-    refs, hyps = [], []
-    sos = getattr(tgt_vocab, 'sos_idx', 2)
-    eos = getattr(tgt_vocab, 'eos_idx', 3)
-    pad = getattr(tgt_vocab, 'pad_idx', 1)
-    def itos(i):
-        if hasattr(tgt_vocab, 'itos'):
-            return tgt_vocab.itos[i]
-        return tgt_vocab.lookup_token(i)
-    with torch.no_grad():
-        for src, tgt in test_dataloader:
-            src, tgt = src.to(device), tgt.to(device)
-            for i in range(src.size(0)):
-                s = src[i:i+1]
-                sm = make_src_mask(s, pad)
-                pred = greedy_decode(model, s, sm, max_len, sos, eos, device=device)[0].tolist()
-                pred_toks = [itos(x) for x in pred if x not in (sos, eos, pad)]
-                gold = tgt[i].tolist()
-                gold_toks = [itos(x) for x in gold if x not in (sos, eos, pad)]
-                hyps.append(pred_toks)
-                refs.append([gold_toks])
-    return corpus_bleu(refs, hyps) * 100
+def run_task_2_1(args):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    train_loader, val_loader, _, src_vocab, tgt_vocab = build_dataloaders(
+        batch_size=args.batch_size,
+        max_length=args.max_len,
+        min_freq=args.min_freq,
+        num_workers=args.num_workers,
+    )
+
+    model = Transformer(
+        src_vocab_size=len(src_vocab),
+        tgt_vocab_size=len(tgt_vocab),
+        d_model=args.d_model,
+        N=args.layers,
+        num_heads=args.heads,
+        d_ff=args.d_ff,
+        dropout=args.dropout,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
+    scheduler = NoamScheduler(optimizer, d_model=args.d_model, warmup_steps=args.warmup_steps) if args.scheduler == 'noam' else None
+    loss_fn = LabelSmoothingLoss(vocab_size=len(tgt_vocab), pad_idx=PAD_IDX, smoothing=0.1)
+
+    run = wandb.init(
+        project=args.project,
+        entity=args.entity if args.entity else None,
+        name=args.run_name,
+        tags=["assignment3", "task2.1", f"scheduler:{args.scheduler}"],
+        config=vars(args),
+    )
+
+    best_val_loss = float('inf')
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_acc = run_epoch(train_loader, model, loss_fn, optimizer, scheduler, is_train=True, device=device)
+        val_loss, val_acc = run_epoch(val_loader, model, loss_fn, None, None, is_train=False, device=device)
+
+        current_lr = optimizer.param_groups[0]['lr']
+        wandb.log({
+            'epoch': epoch,
+            'train/loss': train_loss,
+            'train/token_accuracy': train_acc,
+            'val/loss': val_loss,
+            'val/token_accuracy': val_acc,
+            'optim/lr': current_lr,
+        })
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            os.makedirs(args.ckpt_dir, exist_ok=True)
+            torch.save({'model_state_dict': model.state_dict()}, os.path.join(args.ckpt_dir, f'best_{args.scheduler}.pt'))
+
+    run.finish()
 
 
-def save_checkpoint(model: Transformer, optimizer: torch.optim.Optimizer, scheduler, epoch: int, path: str = 'checkpoint.pt') -> None:
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
-        'model_config': {
-            'src_vocab_size': model.src_vocab_size,
-            'tgt_vocab_size': model.tgt_vocab_size,
-            'd_model': model.d_model,
-            'N': model.N,
-            'num_heads': model.num_heads,
-            'd_ff': model.d_ff,
-            'dropout': model.dropout,
-        }
-    }, path)
-
-
-def load_checkpoint(path: str, model: Transformer, optimizer: Optional[torch.optim.Optimizer] = None, scheduler=None) -> int:
-    ckpt = torch.load(path, map_location='cpu')
-    model.load_state_dict(ckpt['model_state_dict'])
-    if optimizer is not None:
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-    if scheduler is not None and ckpt.get('scheduler_state_dict') is not None:
-        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-    return int(ckpt['epoch'])
-
-
-def run_training_experiment() -> None:
-    raise NotImplementedError
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--project', type=str, default='da6401-a3')
+    p.add_argument('--entity', type=str, default='')
+    p.add_argument('--run_name', type=str, required=True)
+    p.add_argument('--scheduler', choices=['noam', 'fixed'], required=True)
+    p.add_argument('--epochs', type=int, default=20)
+    p.add_argument('--batch_size', type=int, default=64)
+    p.add_argument('--max_len', type=int, default=128)
+    p.add_argument('--min_freq', type=int, default=2)
+    p.add_argument('--num_workers', type=int, default=0)
+    p.add_argument('--d_model', type=int, default=256)
+    p.add_argument('--layers', type=int, default=4)
+    p.add_argument('--heads', type=int, default=8)
+    p.add_argument('--d_ff', type=int, default=1024)
+    p.add_argument('--dropout', type=float, default=0.1)
+    p.add_argument('--warmup_steps', type=int, default=4000)
+    p.add_argument('--lr', type=float, default=1e-4)
+    p.add_argument('--ckpt_dir', type=str, default='checkpoints')
+    return p.parse_args()
 
 
 if __name__ == '__main__':
-    run_training_experiment()
+    args = parse_args()
+    run_task_2_1(args)
