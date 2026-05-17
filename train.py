@@ -55,7 +55,11 @@ def _step_batch(model, src, tgt, loss_fn, device):
     non_pad = tgt_out.ne(PAD_IDX)
     correct = (pred.eq(tgt_out) & non_pad).sum().item()
     total = non_pad.sum().item()
-    return loss, correct, total
+
+    probs = torch.softmax(logits, dim=-1)
+    correct_token_probs = probs.gather(-1, tgt_out.unsqueeze(-1)).squeeze(-1)
+    confidence_sum = (correct_token_probs * non_pad).sum().item()
+    return loss, correct, total, confidence_sum
 
 
 def _l2_norm_from_grad_tensors(grads):
@@ -211,10 +215,10 @@ def run_epoch(
     grad_log_steps: int = 0,
 ):
     model.train(is_train)
-    total_loss, total_correct, total_tokens, steps = 0.0, 0, 0, 0
+    total_loss, total_correct, total_tokens, total_confidence, steps = 0.0, 0, 0, 0.0, 0
 
     for src, tgt in data_iter:
-        loss, correct, total = _step_batch(model, src, tgt, loss_fn, device)
+        loss, correct, total, confidence_sum = _step_batch(model, src, tgt, loss_fn, device)
         if is_train:
             optimizer.zero_grad()
             loss.backward()
@@ -232,11 +236,13 @@ def run_epoch(
         total_loss += loss.item()
         total_correct += correct
         total_tokens += total
+        total_confidence += confidence_sum
         steps += 1
 
     avg_loss = total_loss / max(steps, 1)
     token_acc = total_correct / max(total_tokens, 1)
-    return avg_loss, token_acc, global_step
+    prediction_confidence = total_confidence / max(total_tokens, 1)
+    return avg_loss, token_acc, prediction_confidence, global_step
 
 
 def greedy_decode(model: Transformer, src: torch.Tensor, src_mask: torch.Tensor, max_len: int, start_symbol: int, end_symbol: int, device: str = 'cpu') -> torch.Tensor:
@@ -326,20 +332,20 @@ def run_task_2_1(args):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
     scheduler = NoamScheduler(optimizer, d_model=args.d_model, warmup_steps=args.warmup_steps) if args.scheduler == 'noam' else None
-    loss_fn = LabelSmoothingLoss(vocab_size=len(tgt_vocab), pad_idx=PAD_IDX, smoothing=0.1)
+    loss_fn = LabelSmoothingLoss(vocab_size=len(tgt_vocab), pad_idx=PAD_IDX, smoothing=args.label_smoothing)
 
     run = wandb.init(
         project=args.project,
         entity=args.entity if args.entity else None,
         name=args.run_name,
-        tags=["assignment3", args.task, f"scheduler:{args.scheduler}", f"attention_scaling:{args.attention_scaling}", f"positional_encoding:{args.positional_encoding}"],
+        tags=["assignment3", args.task, f"scheduler:{args.scheduler}", f"attention_scaling:{args.attention_scaling}", f"positional_encoding:{args.positional_encoding}", f"label_smoothing:{args.label_smoothing}"],
         config=vars(args),
     )
 
     best_val_loss = float('inf')
     global_step = 0
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc, global_step = run_epoch(
+        train_loss, train_acc, train_conf, global_step = run_epoch(
             train_loader,
             model,
             loss_fn,
@@ -350,7 +356,7 @@ def run_task_2_1(args):
             global_step=global_step,
             grad_log_steps=args.grad_log_steps,
         )
-        val_loss, val_acc, _ = run_epoch(val_loader, model, loss_fn, None, None, is_train=False, device=device, global_step=global_step)
+        val_loss, val_acc, val_conf, _ = run_epoch(val_loader, model, loss_fn, None, None, is_train=False, device=device, global_step=global_step)
         val_bleu = compute_validation_bleu(model, val_loader, tgt_vocab, device=device, max_decode_len=args.max_len)
 
         current_lr = optimizer.param_groups[0]['lr']
@@ -359,8 +365,10 @@ def run_task_2_1(args):
             'train/global_step': global_step,
             'train/loss': train_loss,
             'train/token_accuracy': train_acc,
+            'train/prediction_confidence': train_conf,
             'val/loss': val_loss,
             'val/token_accuracy': val_acc,
+            'val/prediction_confidence': val_conf,
             'val/bleu': val_bleu,
             'optim/lr': current_lr,
         }, step=global_step)
@@ -385,6 +393,7 @@ def parse_args():
     p.add_argument('--scheduler', choices=['noam', 'fixed'], required=True)
     p.add_argument('--attention_scaling', choices=['scaled', 'unscaled'], default='scaled')
     p.add_argument('--positional_encoding', choices=['sinusoidal', 'learned'], default='sinusoidal')
+    p.add_argument('--label_smoothing', type=float, default=0.1)
     p.add_argument('--grad_log_steps', type=int, default=0)
     p.add_argument('--log_attention_maps', action='store_true')
     p.add_argument('--attention_sample_index', type=int, default=0)
