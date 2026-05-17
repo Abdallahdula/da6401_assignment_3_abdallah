@@ -4,16 +4,14 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-
-try:
-    from datasets import load_dataset
-except Exception:
-    load_dataset = None
+from datasets import load_dataset
 
 
-def scaled_dot_product_attention(Q, K, V, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+def scaled_dot_product_attention(Q, K, V, mask: Optional[torch.Tensor] = None, scale: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
     d_k = Q.size(-1)
-    scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
+    scores = torch.matmul(Q, K.transpose(-2, -1))
+    if scale:
+        scores = scores / math.sqrt(d_k)
     if mask is not None:
         scores = scores.masked_fill(mask, float('-inf'))
     attn = torch.softmax(scores, dim=-1)
@@ -34,17 +32,19 @@ def make_tgt_mask(tgt: torch.Tensor, pad_idx: int = 1) -> torch.Tensor:
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1) -> None:
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1, scale_attention: bool = True) -> None:
         super().__init__()
         assert d_model % num_heads == 0
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
+        self.scale_attention = scale_attention
         self.w_q = nn.Linear(d_model, d_model)
         self.w_k = nn.Linear(d_model, d_model)
         self.w_v = nn.Linear(d_model, d_model)
         self.w_o = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
+        self.last_attn = None
 
     def _split(self, x):
         b, s, _ = x.shape
@@ -58,7 +58,8 @@ class MultiHeadAttention(nn.Module):
         q = self._split(self.w_q(query))
         k = self._split(self.w_k(key))
         v = self._split(self.w_v(value))
-        out, attn = scaled_dot_product_attention(q, k, v, mask)
+        out, attn = scaled_dot_product_attention(q, k, v, mask, scale=self.scale_attention)
+        self.last_attn = attn.detach()
         out = self._combine(out)
         out = self.w_o(out)
         return out
@@ -92,9 +93,9 @@ class PositionwiseFeedForward(nn.Module):
 
 
 class EncoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, scale_attention: bool = True):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, scale_attention=scale_attention)
         self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -107,10 +108,10 @@ class EncoderLayer(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, scale_attention: bool = True):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
-        self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, scale_attention=scale_attention)
+        self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout, scale_attention=scale_attention)
         self.ffn = PositionwiseFeedForward(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -149,7 +150,7 @@ class Decoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, src_vocab_size: int = 10000, tgt_vocab_size: int = 10000, d_model=512, N=6, num_heads=8, d_ff=2048, dropout=0.1, checkpoint_path: str = None):
+    def __init__(self, src_vocab_size: int = 10000, tgt_vocab_size: int = 10000, d_model=512, N=6, num_heads=8, d_ff=2048, dropout=0.1, checkpoint_path: str = None, scale_attention: bool = True):
         super().__init__()
         self.src_vocab_size = src_vocab_size
         self.tgt_vocab_size = tgt_vocab_size
@@ -158,11 +159,12 @@ class Transformer(nn.Module):
         self.num_heads = num_heads
         self.d_ff = d_ff
         self.dropout = dropout
+        self.scale_attention = scale_attention
         self.src_embed = nn.Embedding(src_vocab_size, d_model)
         self.tgt_embed = nn.Embedding(tgt_vocab_size, d_model)
         self.pos = PositionalEncoding(d_model, dropout)
-        self.encoder = Encoder(EncoderLayer(d_model, num_heads, d_ff, dropout), N)
-        self.decoder = Decoder(DecoderLayer(d_model, num_heads, d_ff, dropout), N)
+        self.encoder = Encoder(EncoderLayer(d_model, num_heads, d_ff, dropout, scale_attention=scale_attention), N)
+        self.decoder = Decoder(DecoderLayer(d_model, num_heads, d_ff, dropout, scale_attention=scale_attention), N)
         self.generator = nn.Linear(d_model, tgt_vocab_size)
 
     def encode(self, src, src_mask):
